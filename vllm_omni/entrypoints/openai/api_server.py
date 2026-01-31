@@ -80,7 +80,11 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    BatchSpeechRequest,
+    BatchSpeechResponse,
+    OpenAICreateSpeechRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -767,23 +771,33 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
 
-@router.get(
-    "/v1/audio/voices",
+@router.post(
+    "/v1/audio/speech/batch",
+    dependencies=[Depends(validate_json_request)],
+    response_model=BatchSpeechResponse,
     responses={
-        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.OK.value: {"model": BatchSpeechResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
-async def list_voices(raw_request: Request):
-    """List available TTS voices/speakers from the loaded model."""
+@with_cancellation
+@load_aware_call
+async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
+    """Create speech for multiple texts in a single batch request.
+
+    This endpoint processes multiple TTS requests concurrently and returns
+    all results in a single response. Each request item must have a unique
+    `custom_id` which is included in the corresponding result.
+    """
     handler = Omnispeech(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Speech API")
-
-    speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
-    return JSONResponse(content={"voices": speakers})
+    try:
+        return await handler.create_speech_batch(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
 
 # Health and Model endpoints for diffusion mode

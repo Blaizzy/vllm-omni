@@ -10,8 +10,12 @@ from vllm.utils import random_uuid
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
+    BatchSpeechRequest,
+    BatchSpeechResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
+    SpeechRequestItem,
+    SpeechResultItem,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -300,3 +304,165 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
+
+    def _convert_batch_item_to_request(
+        self,
+        item: SpeechRequestItem,
+        model: str | None = None,
+    ) -> OpenAICreateSpeechRequest:
+        """Convert a batch item to a full speech request."""
+        return OpenAICreateSpeechRequest(
+            input=item.input,
+            model=model,
+            voice=item.voice,
+            instructions=item.instructions,
+            response_format=item.response_format,
+            speed=item.speed,
+            task_type=item.task_type,
+            language=item.language,
+            ref_audio=item.ref_audio,
+            ref_text=item.ref_text,
+            x_vector_only_mode=item.x_vector_only_mode,
+            max_new_tokens=item.max_new_tokens,
+        )
+
+    async def _generate_single_speech(
+        self,
+        item: SpeechRequestItem,
+        model: str | None = None,
+    ) -> SpeechResultItem:
+        """Generate speech for a single batch item and return the result."""
+        import base64
+
+        try:
+            # Convert to full request
+            request = self._convert_batch_item_to_request(item, model)
+
+            # Validate
+            if self._is_tts_model():
+                validation_error = self._validate_tts_request(request)
+                if validation_error:
+                    return SpeechResultItem(custom_id=item.custom_id, error=validation_error)
+
+                tts_params = self._build_tts_params(request)
+                prompt_text = self._build_tts_prompt(request.input)
+                prompt = {
+                    "prompt": prompt_text,
+                    "additional_information": tts_params,
+                }
+            else:
+                return SpeechResultItem(
+                    custom_id=item.custom_id,
+                    error="Model does not support TTS",
+                )
+
+            request_id = f"speech-batch-{random_uuid()}"
+            sampling_params_list = self.engine_client.default_sampling_params_list
+
+            generator = self.engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=["audio"],
+            )
+
+            final_output: OmniRequestOutput | None = None
+            async for res in generator:
+                final_output = res
+
+            if final_output is None:
+                return SpeechResultItem(
+                    custom_id=item.custom_id,
+                    error="No output generated from the model.",
+                )
+
+            # Extract audio from output
+            audio_output = None
+            if hasattr(final_output, "multimodal_output") and final_output.multimodal_output:
+                audio_output = final_output.multimodal_output
+            if (not audio_output or "audio" not in audio_output) and hasattr(final_output, "request_output"):
+                if final_output.request_output and hasattr(final_output.request_output, "multimodal_output"):
+                    audio_output = final_output.request_output.multimodal_output
+
+            if not audio_output or "audio" not in audio_output:
+                return SpeechResultItem(
+                    custom_id=item.custom_id,
+                    error="TTS model did not produce audio output.",
+                )
+
+            audio_tensor = audio_output["audio"]
+            sample_rate = audio_output.get("sr", 24000)
+            if hasattr(sample_rate, "item"):
+                sample_rate = sample_rate.item()
+
+            # Convert tensor to numpy
+            if hasattr(audio_tensor, "float"):
+                audio_tensor = audio_tensor.float().detach().cpu().numpy()
+
+            # Squeeze batch dimension if present
+            if audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.squeeze()
+
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=int(sample_rate),
+                response_format=request.response_format or "wav",
+                speed=request.speed or 1.0,
+                stream_format=request.stream_format,
+                base64_encode=True,  # For batch, return base64
+            )
+
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+
+            # Ensure base64 encoding for batch response
+            audio_data = audio_response.audio_data
+            if isinstance(audio_data, bytes):
+                audio_data = base64.b64encode(audio_data).decode("utf-8")
+
+            return SpeechResultItem(
+                custom_id=item.custom_id,
+                audio_base64=audio_data,
+                media_type=audio_response.media_type,
+            )
+
+        except asyncio.CancelledError:
+            return SpeechResultItem(custom_id=item.custom_id, error="Request cancelled")
+        except Exception as e:
+            logger.exception("Batch speech generation failed for %s: %s", item.custom_id, e)
+            return SpeechResultItem(custom_id=item.custom_id, error=str(e))
+
+    async def create_speech_batch(
+        self,
+        request: BatchSpeechRequest,
+        raw_request: Request | None = None,
+    ) -> BatchSpeechResponse:
+        """
+        Create Speech Batch API for processing multiple TTS requests concurrently.
+
+        This endpoint allows you to submit multiple TTS requests at once and receive
+        all results in a single response. Each request item must have a unique
+        `custom_id` which is returned with the corresponding result.
+
+        Args:
+            request: BatchSpeechRequest containing a list of speech generation requests
+            raw_request: The raw FastAPI request object
+
+        Returns:
+            BatchSpeechResponse with results for each request item
+        """
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        logger.info(
+            "TTS batch request: %d items",
+            len(request.requests),
+        )
+
+        # Process all items concurrently
+        tasks = [
+            self._generate_single_speech(item, request.model)
+            for item in request.requests
+        ]
+        results = await asyncio.gather(*tasks)
+
+        return BatchSpeechResponse(results=list(results))

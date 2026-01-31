@@ -72,3 +72,78 @@ class CreateAudio(BaseModel):
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+
+
+# Batch request/response models for TTS
+
+
+class SpeechRequestItem(BaseModel):
+    """A single item in a batch speech request."""
+
+    custom_id: str = Field(description="A unique identifier for this request within the batch")
+    input: str = Field(description="The text to synthesize")
+    voice: str | None = Field(
+        default=None,
+        description="Voice to use. For Qwen3-TTS: Vivian, Ryan, etc.",
+    )
+    instructions: str | None = Field(
+        default=None,
+        description="Instructions for voice style/emotion",
+    )
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
+
+    # Qwen3-TTS specific parameters
+    task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = Field(
+        default=None,
+        description="TTS task type: CustomVoice, VoiceDesign, or Base (voice clone)",
+    )
+    language: str | None = Field(default=None, description="Language code")
+    ref_audio: str | None = Field(
+        default=None,
+        description="Reference audio for voice cloning (Base task)",
+    )
+    ref_text: str | None = Field(
+        default=None,
+        description="Transcript of reference audio (Base task)",
+    )
+    x_vector_only_mode: bool | None = Field(
+        default=None,
+        description="Use speaker embedding only (Base task)",
+    )
+    max_new_tokens: int | None = Field(default=None, description="Maximum tokens to generate")
+
+
+class BatchSpeechRequest(BaseModel):
+    """Batch request for TTS generation."""
+
+    model: str | None = None
+    requests: list[SpeechRequestItem] = Field(
+        description="List of speech generation requests"
+    )
+
+
+class SpeechResultItem(BaseModel):
+    """A single result in a batch speech response."""
+
+    custom_id: str = Field(description="The unique identifier from the request")
+    audio_base64: str | None = Field(
+        default=None,
+        description="Base64-encoded audio data (on success)",
+    )
+    media_type: str | None = Field(
+        default=None,
+        description="MIME type of the audio (on success)",
+    )
+    error: str | None = Field(
+        default=None,
+        description="Error message (on failure)",
+    )
+
+
+class BatchSpeechResponse(BaseModel):
+    """Batch response for TTS generation."""
+
+    results: list[SpeechResultItem] = Field(
+        description="List of speech generation results"
+    )

@@ -21,6 +21,11 @@ Examples:
         --task-type Base \
         --ref-audio "https://example.com/reference.wav" \
         --ref-text "This is the reference transcript"
+
+    # Batch mode (multiple texts at once)
+    python openai_speech_client.py --batch \
+        --texts "Hello world" "How are you?" "Goodbye!" \
+        --voice Vivian --output-dir ./outputs
 """
 
 import argparse
@@ -118,6 +123,98 @@ def run_tts_generation(args) -> None:
     print(f"Audio saved to: {output_path}")
 
 
+def run_batch_tts_generation(args) -> None:
+    """Run batch TTS generation via /v1/audio/speech/batch API."""
+
+    # Build batch request payload
+    requests = []
+    for i, text in enumerate(args.texts):
+        item = {
+            "custom_id": f"request_{i}",
+            "input": text,
+            "voice": args.voice,
+            "response_format": args.response_format,
+        }
+
+        # Add optional parameters
+        if args.instructions:
+            item["instructions"] = args.instructions
+        if args.task_type:
+            item["task_type"] = args.task_type
+        if args.language:
+            item["language"] = args.language
+        if args.max_new_tokens:
+            item["max_new_tokens"] = args.max_new_tokens
+
+        # Voice clone parameters (Base task)
+        if args.ref_audio:
+            if args.ref_audio.startswith(("http://", "https://")):
+                item["ref_audio"] = args.ref_audio
+            else:
+                item["ref_audio"] = encode_audio_to_base64(args.ref_audio)
+        if args.ref_text:
+            item["ref_text"] = args.ref_text
+        if args.x_vector_only:
+            item["x_vector_only_mode"] = True
+
+        requests.append(item)
+
+    payload = {
+        "model": args.model,
+        "requests": requests,
+    }
+
+    print(f"Model: {args.model}")
+    print(f"Task type: {args.task_type or 'CustomVoice'}")
+    print(f"Batch size: {len(args.texts)} texts")
+    print(f"Voice: {args.voice}")
+    print("Generating audio batch...")
+
+    # Make the API call
+    api_url = f"{args.api_base}/v1/audio/speech/batch"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {args.api_key}",
+    }
+
+    with httpx.Client(timeout=600.0) as client:
+        response = client.post(api_url, json=payload, headers=headers)
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code}")
+        print(response.text)
+        return
+
+    # Parse JSON response
+    batch_response = response.json()
+
+    # Create output directory
+    output_dir = args.output_dir or "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save each audio result
+    success_count = 0
+    error_count = 0
+    for result in batch_response.get("results", []):
+        custom_id = result.get("custom_id", "unknown")
+        if result.get("error"):
+            print(f"  {custom_id}: Error - {result['error']}")
+            error_count += 1
+        elif result.get("audio_base64"):
+            # Decode and save audio
+            audio_data = base64.b64decode(result["audio_base64"])
+            output_path = os.path.join(output_dir, f"{custom_id}.{args.response_format}")
+            with open(output_path, "wb") as f:
+                f.write(audio_data)
+            print(f"  {custom_id}: Saved to {output_path}")
+            success_count += 1
+        else:
+            print(f"  {custom_id}: No audio data")
+            error_count += 1
+
+    print(f"\nBatch complete: {success_count} succeeded, {error_count} failed")
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -157,12 +254,28 @@ def parse_args():
         help="TTS task type (default: CustomVoice)",
     )
 
-    # Input text
+    # Batch mode
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Enable batch mode for processing multiple texts at once",
+    )
+
+    # Input text (single mode)
     parser.add_argument(
         "--text",
         type=str,
-        required=True,
-        help="Text to synthesize",
+        default=None,
+        help="Text to synthesize (single mode)",
+    )
+
+    # Input texts (batch mode)
+    parser.add_argument(
+        "--texts",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Multiple texts to synthesize (batch mode)",
     )
 
     # Voice/speaker
@@ -225,7 +338,13 @@ def parse_args():
         "-o",
         type=str,
         default=None,
-        help="Output audio file path (default: tts_output.wav)",
+        help="Output audio file path (single mode, default: tts_output.wav)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for batch mode (default: current directory)",
     )
 
     return parser.parse_args()
@@ -233,4 +352,16 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run_tts_generation(args)
+
+    if args.batch:
+        # Batch mode
+        if not args.texts:
+            print("Error: --texts is required for batch mode")
+            exit(1)
+        run_batch_tts_generation(args)
+    else:
+        # Single mode
+        if not args.text:
+            print("Error: --text is required for single mode")
+            exit(1)
+        run_tts_generation(args)
