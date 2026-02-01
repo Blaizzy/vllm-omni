@@ -107,52 +107,111 @@ class Qwen3TTSModelForGeneration(nn.Module):
             **kwargs: Additional arguments including task_type, sampling_metadata, etc.
 
         Returns:
-            OmniOutput: Contains multimodal outputs with audio tensors
+            OmniOutput: Contains multimodal outputs with audio tensors.
+            For batch requests, audio is concatenated with lengths stored separately.
         """
 
         # Extract additional parameters from kwargs that the generation methods expect
-
         runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
         if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
             runtime_additional_information = runtime_additional_information[0]
-        text = runtime_additional_information.pop("text", [""])[0]
-        # Extract task_type from kwargs, default to "instruct"
-        task_type = runtime_additional_information.pop("task_type", [self.task_type])[0]
-        speaker = runtime_additional_information.pop("speaker", ["uncle_fu"])[0]
-        language = runtime_additional_information.pop("language", ["Auto"])[0]
-        instruct = runtime_additional_information.pop("instruct", [""])[0]
-        for key, value in runtime_additional_information.items():
-            if isinstance(value, list) and len(value) > 0:
+
+        # Extract parameters - keep as lists for batch support
+        texts = runtime_additional_information.pop("text", [""])
+        task_types = runtime_additional_information.pop("task_type", [self.task_type])
+        speakers = runtime_additional_information.pop("speaker", ["uncle_fu"])
+        languages = runtime_additional_information.pop("language", ["Auto"])
+        instructs = runtime_additional_information.pop("instruct", [""])
+
+        # Determine batch size from texts
+        batch_size = len(texts) if isinstance(texts, list) else 1
+
+        # For single item (non-batch), extract scalar values for backward compatibility
+        if batch_size == 1:
+            text = texts[0] if isinstance(texts, list) else texts
+            task_type = task_types[0] if isinstance(task_types, list) else task_types
+            speaker = speakers[0] if isinstance(speakers, list) else speakers
+            language = languages[0] if isinstance(languages, list) else languages
+            instruct = instructs[0] if isinstance(instructs, list) else instructs
+
+            # Unwrap remaining list parameters for single-item requests
+            for key, value in runtime_additional_information.items():
+                if isinstance(value, list) and len(value) > 0:
+                    runtime_additional_information[key] = value[0]
+
+            # During profile/warmup runs, text is empty and no real inputs exist.
+            if not text:
+                logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
+                runtime_additional_information["max_new_tokens"] = 2
+
+            # Call the appropriate generation method based on task_type
+            if task_type == "CustomVoice":
+                result = self.model.generate_custom_voice(
+                    text, speaker=speaker, language=language, instruct=instruct, **runtime_additional_information
+                )
+            elif task_type == "VoiceDesign":
+                result = self.model.generate_voice_design(
+                    text, instruct=instruct, language=language, **runtime_additional_information
+                )
+            elif task_type == "Base":
+                result = self.model.generate_voice_clone(text, language=language, **runtime_additional_information)
+            else:
+                raise ValueError(f"Invalid task type: {task_type}")
+
+            # Convert result to OmniOutput format
+            return self.make_omni_output(result, **kwargs)
+
+        # Batch processing - pass lists to model methods (they support batching natively)
+        logger.info(f"Batch TTS request: {batch_size} items")
+
+        # Ensure all parameters are lists of the correct length
+        if not isinstance(texts, list):
+            texts = [texts]
+        if not isinstance(task_types, list):
+            task_types = [task_types] * batch_size
+        elif len(task_types) == 1:
+            task_types = task_types * batch_size
+        if not isinstance(speakers, list):
+            speakers = [speakers] * batch_size
+        elif len(speakers) == 1:
+            speakers = speakers * batch_size
+        if not isinstance(languages, list):
+            languages = [languages] * batch_size
+        elif len(languages) == 1:
+            languages = languages * batch_size
+        if not isinstance(instructs, list):
+            instructs = [instructs] * batch_size
+        elif len(instructs) == 1:
+            instructs = instructs * batch_size
+
+        # Unwrap scalar parameters that are wrapped in single-element lists
+        for key, value in list(runtime_additional_information.items()):
+            if isinstance(value, list) and len(value) == 1:
                 runtime_additional_information[key] = value[0]
 
-        # During profile/warmup runs, text is empty and no real inputs exist.
-        # Cap generation steps so the full pipeline executes (preserving
-        # KV-cache profiling behaviour) but exits quickly even if the model
-        # cannot converge from degenerate dummy inputs.
-        if not text:
-            logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
-            runtime_additional_information["max_new_tokens"] = 2
+        # Use the first task_type to determine the generation method
+        task_type = task_types[0]
 
-        # Call the appropriate generation method based on task_type
+        # Call the appropriate generation method with batched inputs
         if task_type == "CustomVoice":
             result = self.model.generate_custom_voice(
-                text, speaker=speaker, language=language, instruct=instruct, **runtime_additional_information
+                texts, speaker=speakers, language=languages, instruct=instructs, **runtime_additional_information
             )
         elif task_type == "VoiceDesign":
             result = self.model.generate_voice_design(
-                text, instruct=instruct, language=language, **runtime_additional_information
+                texts, instruct=instructs, language=languages, **runtime_additional_information
             )
         elif task_type == "Base":
-            result = self.model.generate_voice_clone(text, language=language, **runtime_additional_information)
+            result = self.model.generate_voice_clone(texts, language=languages, **runtime_additional_information)
         else:
             raise ValueError(f"Invalid task type: {task_type}")
 
-        # Convert result to OmniOutput format
-        return self.make_omni_output(result, **kwargs)
+        # Convert batched result to OmniOutput format (concatenated with lengths)
+        return self.make_omni_output_batch(result, batch_size, **kwargs)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         """
-        Make an OmniOutput object from model outputs.
+        Make an OmniOutput object from model outputs (single item).
         Args:
             model_outputs: Model outputs (either OmniOutput, tuple of (audio_tensors, sr), or tensor)
         """
@@ -183,6 +242,60 @@ class Qwen3TTSModelForGeneration(nn.Module):
             )
 
         raise ValueError(f"Unsupported model_outputs type: {type(model_outputs)}")
+
+    def make_omni_output_batch(
+        self, model_outputs: tuple, batch_size: int, **kwargs: Any
+    ) -> OmniOutput:
+        """
+        Make an OmniOutput object from batched model outputs.
+
+        Concatenates all audio tensors into a single tensor and stores lengths
+        separately, allowing proper serialization through vLLM's msgspec.
+
+        Args:
+            model_outputs: Tuple of (audio_tensors_list, sample_rate) where
+                          audio_tensors_list is a list of numpy arrays
+            batch_size: Number of items in the batch
+
+        Returns:
+            OmniOutput with multimodal_outputs containing:
+                - "model_outputs": concatenated audio tensor
+                - "audio_lengths": tensor of individual audio lengths
+                - "sr": sample rate tensor
+        """
+        if not isinstance(model_outputs, tuple) or len(model_outputs) != 2:
+            raise ValueError(f"Expected tuple (audio_tensors, sr), got {type(model_outputs)}")
+
+        audio_tensors_list, sr = model_outputs
+
+        if not isinstance(audio_tensors_list, list):
+            raise ValueError(f"Expected list of audio tensors, got {type(audio_tensors_list)}")
+
+        # Convert each numpy array to tensor and track lengths
+        converted_tensors = []
+        lengths = []
+        for audio_tensor in audio_tensors_list:
+            if isinstance(audio_tensor, np.ndarray):
+                t = torch.from_numpy(audio_tensor).float()
+            elif isinstance(audio_tensor, torch.Tensor):
+                t = audio_tensor.float()
+            else:
+                t = torch.tensor(audio_tensor, dtype=torch.float32)
+            converted_tensors.append(t)
+            lengths.append(t.shape[0])
+
+        # Concatenate all audio into a single tensor
+        audio_concat = torch.cat(converted_tensors, dim=0)
+        lengths_tensor = torch.tensor(lengths, dtype=torch.int64)
+
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={
+                "model_outputs": audio_concat,
+                "audio_lengths": lengths_tensor,
+                "sr": torch.tensor(sr, dtype=torch.int32),
+            },
+        )
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device

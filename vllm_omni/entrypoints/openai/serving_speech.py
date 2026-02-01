@@ -184,6 +184,67 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    def _build_batch_tts_params(self, items: list[SpeechRequestItem]) -> dict[str, Any]:
+        """Build batched TTS parameters from multiple request items.
+
+        Combines parameters from all items into lists for true batch processing.
+        All values must be lists (not scalars) for the input processor.
+        """
+        params: dict[str, Any] = {}
+
+        # Collect all texts
+        params["text"] = [item.input for item in items]
+
+        # Collect task types
+        task_types = []
+        for item in items:
+            task_types.append(item.task_type if item.task_type is not None else "CustomVoice")
+        params["task_type"] = task_types
+
+        # Collect languages
+        params["language"] = [
+            item.language if item.language is not None else "Auto"
+            for item in items
+        ]
+
+        # Collect speakers (voices)
+        speakers = []
+        for i, item in enumerate(items):
+            if item.voice is not None:
+                speakers.append(item.voice.lower())
+            elif task_types[i] == "CustomVoice":
+                speakers.append("vivian")
+            else:
+                speakers.append("")
+        params["speaker"] = speakers
+
+        # Collect instructions
+        params["instruct"] = [
+            item.instructions if item.instructions is not None else ""
+            for item in items
+        ]
+
+        # Voice clone parameters (used with Base task)
+        ref_audios = [item.ref_audio if item.ref_audio else "" for item in items]
+        if any(r for r in ref_audios):
+            params["ref_audio"] = ref_audios
+        ref_texts = [item.ref_text if item.ref_text else "" for item in items]
+        if any(r for r in ref_texts):
+            params["ref_text"] = ref_texts
+        x_vector_modes = [item.x_vector_only_mode if item.x_vector_only_mode else False for item in items]
+        if any(x for x in x_vector_modes):
+            params["x_vector_only_mode"] = x_vector_modes
+
+        # Generation parameters - use max from all items
+        max_tokens_list = [item.max_new_tokens for item in items]
+        if any(m is not None for m in max_tokens_list):
+            max_val = max(m if m is not None else 2048 for m in max_tokens_list)
+            params["max_new_tokens"] = [max_val]
+        else:
+            params["max_new_tokens"] = [2048]
+
+        return params
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -437,11 +498,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         raw_request: Request | None = None,
     ) -> BatchSpeechResponse:
         """
-        Create Speech Batch API for processing multiple TTS requests concurrently.
+        Create Speech Batch API for processing multiple TTS requests in a single GPU batch.
 
         This endpoint allows you to submit multiple TTS requests at once and receive
         all results in a single response. Each request item must have a unique
         `custom_id` which is returned with the corresponding result.
+
+        TRUE GPU BATCHING: All requests are processed together in a single model
+        forward pass for maximum GPU efficiency.
 
         Args:
             request: BatchSpeechRequest containing a list of speech generation requests
@@ -450,19 +514,187 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Returns:
             BatchSpeechResponse with results for each request item
         """
+        import base64
+
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        logger.info(
-            "TTS batch request: %d items",
-            len(request.requests),
-        )
+        batch_size = len(request.requests)
+        logger.info("TTS batch request (GPU batching): %d items", batch_size)
 
-        # Process all items concurrently
-        tasks = [
-            self._generate_single_speech(item, request.model)
-            for item in request.requests
-        ]
-        results = await asyncio.gather(*tasks)
+        # Validate all items first
+        custom_ids = []
+        valid_items = []
+        results: list[SpeechResultItem | None] = [None] * batch_size
+        item_indices: dict[int, int] = {}  # Map valid item index to original index
 
-        return BatchSpeechResponse(results=list(results))
+        if not self._is_tts_model():
+            return BatchSpeechResponse(
+                results=[
+                    SpeechResultItem(custom_id=item.custom_id, error="Model does not support TTS")
+                    for item in request.requests
+                ]
+            )
+
+        for i, item in enumerate(request.requests):
+            custom_ids.append(item.custom_id)
+            full_request = self._convert_batch_item_to_request(item, request.model)
+            validation_error = self._validate_tts_request(full_request)
+
+            if validation_error:
+                results[i] = SpeechResultItem(custom_id=item.custom_id, error=validation_error)
+            else:
+                item_indices[len(valid_items)] = i
+                valid_items.append(item)
+
+        if not valid_items:
+            return BatchSpeechResponse(results=results)
+
+        try:
+            # Build batched TTS parameters
+            batch_params = self._build_batch_tts_params(valid_items)
+
+            # Build prompt (text content is in batch_params)
+            prompt_text = self._build_tts_prompt(valid_items[0].input)
+            prompt = {
+                "prompt": prompt_text,
+                "additional_information": batch_params,
+            }
+
+            request_id = f"speech-batch-{random_uuid()}"
+            sampling_params_list = self.engine_client.default_sampling_params_list
+
+            generator = self.engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=["audio"],
+            )
+
+            final_output: OmniRequestOutput | None = None
+            async for res in generator:
+                final_output = res
+
+            if final_output is None:
+                for valid_idx, orig_idx in item_indices.items():
+                    results[orig_idx] = SpeechResultItem(
+                        custom_id=custom_ids[orig_idx],
+                        error="No output generated from the model.",
+                    )
+                return BatchSpeechResponse(results=results)
+
+            # Extract audio output
+            audio_output = None
+            if hasattr(final_output, "multimodal_output") and final_output.multimodal_output:
+                audio_output = final_output.multimodal_output
+            if (not audio_output or "audio" not in audio_output) and hasattr(final_output, "request_output"):
+                if final_output.request_output and hasattr(final_output.request_output, "multimodal_output"):
+                    audio_output = final_output.request_output.multimodal_output
+
+            if not audio_output:
+                for valid_idx, orig_idx in item_indices.items():
+                    results[orig_idx] = SpeechResultItem(
+                        custom_id=custom_ids[orig_idx],
+                        error="TTS model did not produce audio output.",
+                    )
+                return BatchSpeechResponse(results=results)
+
+            # Get concatenated audio and lengths
+            audio_concat = audio_output.get("audio")
+            audio_lengths = audio_output.get("audio_lengths")
+            sample_rate = audio_output.get("sr", 24000)
+            if hasattr(sample_rate, "item"):
+                sample_rate = sample_rate.item()
+
+            # Check if this is a batch output (has lengths) or single output
+            if audio_lengths is not None:
+                # True batch output - split concatenated audio using lengths
+                if hasattr(audio_lengths, "tolist"):
+                    lengths_list = audio_lengths.tolist()
+                else:
+                    lengths_list = list(audio_lengths)
+
+                # Convert audio_concat to numpy if needed
+                if hasattr(audio_concat, "float"):
+                    audio_concat = audio_concat.float().detach().cpu().numpy()
+
+                # Split into individual audio tensors
+                audio_tensors = []
+                offset = 0
+                for length in lengths_list:
+                    audio_tensors.append(audio_concat[offset:offset + length])
+                    offset += length
+
+                logger.info("Batch output: %d audio segments from concatenated tensor", len(audio_tensors))
+            else:
+                # Single output (fallback)
+                if hasattr(audio_concat, "float"):
+                    audio_concat = audio_concat.float().detach().cpu().numpy()
+                if audio_concat.ndim > 1:
+                    audio_concat = audio_concat.squeeze()
+                audio_tensors = [audio_concat]
+
+            # Process each audio and create results
+            for valid_idx, audio_tensor in enumerate(audio_tensors):
+                orig_idx = item_indices.get(valid_idx)
+                if orig_idx is None:
+                    continue
+
+                item = valid_items[valid_idx]
+
+                try:
+                    # Squeeze if needed
+                    if audio_tensor.ndim > 1:
+                        audio_tensor = audio_tensor.squeeze()
+
+                    audio_obj = CreateAudio(
+                        audio_tensor=audio_tensor,
+                        sample_rate=int(sample_rate),
+                        response_format=item.response_format or "wav",
+                        speed=item.speed or 1.0,
+                        base64_encode=True,
+                    )
+
+                    audio_response: AudioResponse = self.create_audio(audio_obj)
+
+                    audio_bytes = audio_response.audio_data
+                    if isinstance(audio_bytes, bytes):
+                        audio_bytes = base64.b64encode(audio_bytes).decode("utf-8")
+
+                    results[orig_idx] = SpeechResultItem(
+                        custom_id=item.custom_id,
+                        audio_base64=audio_bytes,
+                        media_type=audio_response.media_type,
+                    )
+                except Exception as e:
+                    logger.exception("Failed to process batch audio item %d: %s", valid_idx, e)
+                    results[orig_idx] = SpeechResultItem(
+                        custom_id=item.custom_id,
+                        error=f"Failed to process audio: {e}",
+                    )
+
+            # Fill in any missing results
+            for i, result in enumerate(results):
+                if result is None:
+                    results[i] = SpeechResultItem(
+                        custom_id=custom_ids[i],
+                        error="Unexpected error: result not generated",
+                    )
+
+            return BatchSpeechResponse(results=results)
+
+        except asyncio.CancelledError:
+            return BatchSpeechResponse(
+                results=[
+                    SpeechResultItem(custom_id=cid, error="Request cancelled")
+                    for cid in custom_ids
+                ]
+            )
+        except Exception as e:
+            logger.exception("Batch speech generation failed: %s", e)
+            return BatchSpeechResponse(
+                results=[
+                    SpeechResultItem(custom_id=cid, error=str(e))
+                    for cid in custom_ids
+                ]
+            )
